@@ -114,7 +114,7 @@ def read_mask(validation_mask, fps, n_total_frames, img_size, mask_dilation_iter
 
     return masks, masked_images
 
-def read_priori(priori, fps, n_total_frames, img_size):
+def read_priori(priori, fps, n_total_frames, img_size, remove=True):
     cap = cv2.VideoCapture(priori)
     if not cap.isOpened():
         print("Error: Could not open video.")
@@ -139,7 +139,8 @@ def read_priori(priori, fps, n_total_frames, img_size):
         idx += 1
     cap.release()
 
-    os.remove(priori) # remove priori 
+    if remove:
+        os.remove(priori)
 
     return prioris
 
@@ -240,11 +241,11 @@ class DiffuEraser:
                     timestep_spacing="trailing",
                 )
         self.num_inference_steps = checkpoints[ckpt][1]
-        self.guidance_scale = 0
 
     def forward(self, validation_image, validation_mask, priori, output_path,
                 max_img_size = 1280, video_length=2, mask_dilation_iter=4,
-                nframes=22, seed=None, revision = None, guidance_scale=None, blended=True):
+                nframes=22, seed=None, revision = None, guidance_scale=None,
+                blended=True, keep_priori=False):
         validation_prompt = ""  # 
         guidance_scale_final = self.guidance_scale if guidance_scale==None else guidance_scale
 
@@ -259,7 +260,7 @@ class DiffuEraser:
         validation_masks_input, validation_images_input = read_mask(validation_mask, fps, video_len, img_size, mask_dilation_iter, frames)
   
         ################    read priori   ################  
-        prioris = read_priori(priori, fps, n_total_frames, img_size)
+        prioris = read_priori(priori, fps, n_total_frames, img_size, remove=not keep_priori)
 
         ## recheck
         n_total_frames = min(min(len(frames), len(validation_masks_input)), len(prioris))
@@ -303,19 +304,23 @@ class DiffuEraser:
         noise = repeat(noise_pre, "t c h w->(repeat t) c h w", repeat=n_clip)[:real_video_length,...]
         
         ################  prepare priori  ################
-        images_preprocessed = []
-        for image in prioris:
-            image = self.image_processor.preprocess(image, height=tar_height, width=tar_width).to(dtype=torch.float32)
-            image = image.to(device=torch.device(self.device), dtype=torch.float16)
-            images_preprocessed.append(image)
-        pixel_values = torch.cat(images_preprocessed)
-
+        # Encode the prior in bounded GPU batches.  The original code first
+        # stored every preprocessed frame on CUDA and then concatenated a
+        # second full-video tensor; at 324x960p this needlessly consumed about
+        # two extra GiB and made Normal-CFG inference OOM although each 22-frame
+        # diffusion window fits.  Only the compact VAE latents persist here.
         with torch.no_grad():
-            pixel_values = pixel_values.to(dtype=torch.float16)
             latents = []
             num=4
-            for i in range(0, pixel_values.shape[0], num):
-                latents.append(self.vae.encode(pixel_values[i : i + num]).latent_dist.sample())
+            for i in range(0, len(prioris), num):
+                pixel_values = torch.cat([
+                    self.image_processor.preprocess(
+                        image, height=tar_height, width=tar_width
+                    ).to(device=torch.device(self.device), dtype=torch.float16)
+                    for image in prioris[i : i + num]
+                ])
+                latents.append(self.vae.encode(pixel_values).latent_dist.sample())
+                del pixel_values
             latents = torch.cat(latents, dim=0)
         latents = latents * self.vae.config.scaling_factor #[(b f), c1, h, w], c1=4
         torch.cuda.empty_cache()  
@@ -427,6 +432,4 @@ class DiffuEraser:
 
         return output_path
             
-
-
 
